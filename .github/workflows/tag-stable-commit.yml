@@ -2,7 +2,14 @@
 name: Check latest MicroCeph channel
 
 on:
-  workflow_dispatch:        # run on demand
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    # Optional – run it only when certain files change
+    # paths:
+    #   - '**/*.yml'
+    #   - '**/*.yaml'
+
+    workflow_dispatch:        # run on demand
   schedule:                 # …or every night at 02:00 UTC
     - cron: '0 2 * * *'
 
