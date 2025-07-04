@@ -9,10 +9,6 @@ on:
     #   - '**/*.yml'
     #   - '**/*.yaml'
 
-    workflow_dispatch:        # run on demand
-  schedule:                 # …or every night at 02:00 UTC
-    - cron: '0 2 * * *'
-
 jobs:
   microceph-channel:
     runs-on: ubuntu-latest
