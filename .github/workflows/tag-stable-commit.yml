@@ -1,0 +1,114 @@
+# .github/workflows/check-microceph-channel.yml
+name: Check latest MicroCeph channel
+
+on:
+  workflow_dispatch:        # run on demand
+  schedule:                 # …or every night at 02:00 UTC
+    - cron: '0 2 * * *'
+
+jobs:
+  microceph-channel:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # required for commit look‑up via the API
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    #################################################################
+    # 1. Install the snap
+    #################################################################
+    - name: Install MicroCeph snap
+      run: |
+        sudo snap install microceph
+
+    #################################################################
+    # 2 & 3. Grab the first channel line *after* “channels:”,
+    #        then parse <flavour>, <version> and <commit>.
+    #################################################################
+    - name: Extract channel information
+      id: snap
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const core       = require('@actions/core');
+          const {execSync} = require('child_process');
+
+          // Run `snap info microceph`
+          const info = execSync('snap info microceph', {encoding: 'utf-8'});
+          core.info('--- snap info ---\n' + info + '\n------------------');
+
+          // Find the first non‑blank line after the "channels:" header
+          const lines      = info.split('\n');
+          const headerIdx  = lines.findIndex(l => l.startsWith('channels:'));
+          if (headerIdx === -1) core.setFailed('Could not find "channels:" header');
+
+          const channelRaw = lines.slice(headerIdx + 1)
+                                   .find(l => l.trim().length > 0);
+          core.info(`Channel line: "${channelRaw}"`);
+
+          /* Example line:
+               squid/stable:     19.2.0+snapab139d4a1f 2025-06-26 (1393) 117MB -
+               └─────┬────┘      └──────┬─────┘ └──┬──┘
+                 flavour          version    commit
+          */
+          const m = channelRaw.match(
+            /^\s*([^/]+)\/stable:\s+(\d+\.\d+\.\d+)\+snap([a-f0-9]+)\s/
+          );
+
+          if (!m) core.setFailed('Failed to parse channel line');
+
+          const [, flavour, version, commit] = m;
+
+          core.setOutput('flavour', flavour);
+          core.setOutput('version', version);
+          core.setOutput('commit',  commit);
+
+          core.info(`flavour=${flavour}`);
+          core.info(`version=${version}`);
+          core.info(`commit=${commit}`);
+
+    #################################################################
+    # 4. Check if a matching commit exists in the repository.
+    #    We trim to 9 characters because that is the length the
+    #    example ("ab139d4a1") uses and is generally unique in Git.
+    #################################################################
+    - name: Verify commit exists
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const core    = require('@actions/core');
+          const github  = require('@actions/github');
+
+          const shortSHA = '${{ steps.snap.outputs.commit }}'.substring(0, 9);
+          core.info(`Searching for commit starting with "${shortSHA}" …`);
+
+          // 1. Try a direct lookup (works when the API accepts the prefix)
+          try {
+            const {data} = await github.rest.repos.getCommit({
+              owner:  github.context.repo.owner,
+              repo:   github.context.repo.repo,
+              ref:    shortSHA
+            });
+            core.info(`✅ Commit found: ${data.html_url}`);
+            return;
+          } catch (_err) {
+            core.warning('Direct lookup failed, falling back to manual search.');
+          }
+
+          // 2. Fall back: walk recent commits and look for a matching prefix
+          const commits = await github.paginate(
+            github.rest.repos.listCommits,
+            { owner: github.context.repo.owner,
+              repo:  github.context.repo.repo,
+              per_page: 100 }
+          );
+
+          const match = commits.find(c => c.sha.startsWith(shortSHA));
+
+          if (match) {
+            core.info(`✅ Commit found: ${match.html_url}`);
+          } else {
+            core.setFailed(`❌ No commit with prefix "${shortSHA}" found in repository`);
+          }
