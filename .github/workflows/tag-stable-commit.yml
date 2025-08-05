@@ -1,20 +1,25 @@
 name: Tag stable MicroCeph commit
 
 on:
+  # Trigger on PRs to main
   pull_request:
     types: [opened, synchronize, reopened]
     branches:
-      - main  # Change if your default branch is not "main"
-  # Uncomment to enable manual and scheduled runs
-  # workflow_dispatch:
-  # schedule:
-  #   - cron: '0 0 * * MON,THU'  # Optional: biweekly on Mondays and Thursdays
+      - main  # change if your default branch is different
+
+  # Allow manual trigger from Actions UI
+  workflow_dispatch:
+    inputs:
+      run_tagging:
+        description: 'Run stable tag update logic'
+        required: false
+        default: 'true'
 
 jobs:
   tag-stable-commit:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Needed for commit search via the API and to write a tag
+      contents: write  # Required to update/create tags
 
     steps:
       - name: Checkout repository
@@ -30,7 +35,6 @@ jobs:
         with:
           script: |
             const { execSync } = require('child_process');
-
             const info = execSync('snap info microceph', { encoding: 'utf-8' });
             const lines = info.split('\n');
             const headerIdx = lines.findIndex(l => l.trim().startsWith('channels:'));
@@ -38,41 +42,31 @@ jobs:
               core.setFailed('Could not find "channels:" in snap info output');
               return;
             }
-
             const channelRaw = lines.slice(headerIdx + 1)
-              .find(l => l.includes('/stable:'));
+                                    .find(l => l.includes('/stable:'));
             if (!channelRaw) {
               core.setFailed('Could not find a "/stable:" channel line');
               return;
             }
-
             core.info(`Channel line: "${channelRaw}"`);
-
-            const m = channelRaw.match(
-              /^\s*([a-z]+)\/stable:\s+([0-9.]+)\+snap([a-f0-9]+)\s/
-            );
+            const m = channelRaw.match(/^\s*([a-z]+)\/stable:\s+([0-9.]+)\+snap([a-f0-9]+)\s/);
             if (!m) {
               core.setFailed('Failed to parse channel line');
               return;
             }
-
             const [, codeName, version, commit] = m;
-
             if (!codeName || codeName.length < 1) {
               core.setFailed(`Invalid codeName: "${codeName}"`);
               return;
             }
-
             if (!version || version.length < 6) {
               core.setFailed(`Invalid version: "${version}"`);
               return;
             }
-
             if (!commit || commit.length < 7) {
               core.setFailed(`Invalid commit: "${commit}"`);
               return;
             }
-
             core.setOutput('codeName', codeName);
             core.setOutput('version', version);
             core.setOutput('commit', commit);
@@ -87,7 +81,6 @@ jobs:
           script: |
             const target = '${{ steps.snap.outputs.commit }}'.slice(0, 7);
             core.info(`Looking for a commit starting with "${target}" …`);
-
             const commits = await github.paginate(
               github.rest.repos.listCommits,
               {
@@ -96,29 +89,29 @@ jobs:
                 per_page: 100
               }
             );
-
             const hit = commits.find(c => c.sha.startsWith(target));
             if (hit) {
-              core.info(`✅ Found commit: ${hit.sha} — ${hit.html_url}`);
+              core.setOutput('full_sha', hit.sha);
               const firstLine = hit.commit.message.split('\n')[0];
+              core.info(`Found commit: ${hit.sha} — ${hit.html_url}`);
               core.info(`Commit message first line: "${firstLine}"`);
             } else {
-              core.setFailed(`❌ No commit starting with "${target}" found in the repository`);
+              core.setFailed(`No commit starting with "${target}" found in the repository`);
             }
 
-      - name: Move latest tag to verified commit
+      - name: Move stable tag to verified commit
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const commitSha = '${{ steps.verify.outputs.full_sha }}';
             const codeName = '${{ steps.snap.outputs.codeName }}';
             const version = '${{ steps.snap.outputs.version }}';
-            const commitId = '${{ steps.snap.outputs.commit }}';
-            const commitPrefix = commitId.slice(0, 7);
             const stableTag = `v${version}+${codeName}`;
 
-            core.info(`Generated stable tag: "${stableTag}"`);
+            core.info(`Proposed stable tag: ${stableTag}`);
 
+            // Get all tags
             const tags = await github.paginate(
               github.rest.repos.listTags,
               {
@@ -128,42 +121,31 @@ jobs:
               }
             );
 
-            if (tags.length > 0) {
-              const latestTag = tags[0].name;
-              core.info(`Latest tag in repo: "${latestTag}"`);
-
-              if (latestTag === stableTag) {
-                core.info(`✅ Latest tag "${stableTag}" already applied. Nothing to do.`);
-                return;
-              }
-            } else {
-              core.info('No tags found. Will create the first one.');
-            }
-
-            const commits = await github.paginate(
-              github.rest.repos.listCommits,
-              {
+            if (tags.length === 0) {
+              core.info(`No tags found. Creating "${stableTag}" pointing to ${commitSha}`);
+              await github.rest.git.createRef({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                per_page: 100
-              }
-            );
-
-            const targetCommit = commits.find(c => c.sha.startsWith(commitPrefix));
-            if (!targetCommit) {
-              core.setFailed(`❌ Commit starting with "${commitPrefix}" not found.`);
+                ref: `refs/tags/${stableTag}`,
+                sha: commitSha
+              });
               return;
             }
 
-            core.info(`Found commit: ${targetCommit.sha} — ${targetCommit.html_url}`);
-            const firstLine = targetCommit.commit.message.split('\n')[0];
-            core.info(`Commit message first line: "${firstLine}"`);
+            const latestTag = tags[0];
+            core.info(`Latest existing tag: ${latestTag.name}`);
 
+            if (latestTag.name === stableTag) {
+              core.info(`Tag "${stableTag}" already exists as latest tag. Nothing to do.`);
+              return;
+            }
+
+            core.info(`Creating tag "${stableTag}" on commit ${commitSha}`);
             await github.rest.git.createRef({
               owner: context.repo.owner,
               repo: context.repo.repo,
               ref: `refs/tags/${stableTag}`,
-              sha: targetCommit.sha
+              sha: commitSha
             });
 
-            core.info(`✅ Tag "${stableTag}" created at ${targetCommit.sha}`);
+            core.info(`Tag "${stableTag}" now created.`)
