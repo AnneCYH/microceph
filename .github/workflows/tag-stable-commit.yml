@@ -1,0 +1,151 @@
+name: Tag stable MicroCeph commit
+
+on:
+  # Trigger on PRs to main
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main  # change if your default branch is different
+
+  # Allow manual trigger from Actions UI
+  workflow_dispatch:
+    inputs:
+      run_tagging:
+        description: 'Run stable tag update logic'
+        required: false
+        default: 'true'
+
+jobs:
+  tag-stable-commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to update/create tags
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install MicroCeph snap
+        run: |
+          sudo snap install microceph
+
+      - name: Extract channel information
+        id: snap
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const info = execSync('snap info microceph', { encoding: 'utf-8' });
+            const lines = info.split('\n');
+            const headerIdx = lines.findIndex(l => l.trim().startsWith('channels:'));
+            if (headerIdx === -1) {
+              core.setFailed('Could not find "channels:" in snap info output');
+              return;
+            }
+            const channelRaw = lines.slice(headerIdx + 1)
+                                    .find(l => l.includes('/stable:'));
+            if (!channelRaw) {
+              core.setFailed('Could not find a "/stable:" channel line');
+              return;
+            }
+            core.info(`Channel line: "${channelRaw}"`);
+            const m = channelRaw.match(/^\s*([a-z]+)\/stable:\s+([0-9.]+)\+snap([a-f0-9]+)\s/);
+            if (!m) {
+              core.setFailed('Failed to parse channel line');
+              return;
+            }
+            const [, codeName, version, commit] = m;
+            if (!codeName || codeName.length < 1) {
+              core.setFailed(`Invalid codeName: "${codeName}"`);
+              return;
+            }
+            if (!version || version.length < 6) {
+              core.setFailed(`Invalid version: "${version}"`);
+              return;
+            }
+            if (!commit || commit.length < 7) {
+              core.setFailed(`Invalid commit: "${commit}"`);
+              return;
+            }
+            core.setOutput('codeName', codeName);
+            core.setOutput('version', version);
+            core.setOutput('commit', commit);
+            core.info(`codeName=${codeName}`);
+            core.info(`version=${version}`);
+            core.info(`commit=${commit}`);
+
+      - name: Verify commit exists
+        id: verify
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const target = '${{ steps.snap.outputs.commit }}'.slice(0, 7);
+            core.info(`Looking for a commit starting with "${target}" …`);
+            const commits = await github.paginate(
+              github.rest.repos.listCommits,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              }
+            );
+            const hit = commits.find(c => c.sha.startsWith(target));
+            if (hit) {
+              core.setOutput('full_sha', hit.sha);
+              const firstLine = hit.commit.message.split('\n')[0];
+              core.info(`Found commit: ${hit.sha} — ${hit.html_url}`);
+              core.info(`Commit message first line: "${firstLine}"`);
+            } else {
+              core.setFailed(`No commit starting with "${target}" found in the repository`);
+            }
+
+      - name: Move stable tag to verified commit
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commitSha = '${{ steps.verify.outputs.full_sha }}';
+            const codeName = '${{ steps.snap.outputs.codeName }}';
+            const version = '${{ steps.snap.outputs.version }}';
+            const stableTag = `v${version}+${codeName}`;
+
+            core.info(`Proposed stable tag: ${stableTag}`);
+
+            // Get all tags
+            const tags = await github.paginate(
+              github.rest.repos.listTags,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              }
+            );
+
+            if (tags.length === 0) {
+              core.info(`No tags found. Creating "${stableTag}" pointing to ${commitSha}`);
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/tags/${stableTag}`,
+                sha: commitSha
+              });
+              return;
+            }
+
+            const latestTag = tags[0];
+            core.info(`Latest existing tag: ${latestTag.name}`);
+
+            if (latestTag.name === stableTag) {
+              core.info(`Tag "${stableTag}" already exists as latest tag. Nothing to do.`);
+              return;
+            }
+
+            core.info(`Creating tag "${stableTag}" on commit ${commitSha}`);
+            await github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `refs/tags/${stableTag}`,
+              sha: commitSha
+            });
+
+            core.info(`Tag "${stableTag}" now created.`)
