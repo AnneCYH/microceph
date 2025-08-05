@@ -19,7 +19,10 @@ jobs:
   tag-stable-commit:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Required to update/create tags
+      contents: write  # Still useful for automatic GITHUB_TOKEN scenarios
+
+    env:
+      GH_TOKEN: ${{ secrets.PAT_TAGGING }}  # Use PAT for GitHub API calls
 
     steps:
       - name: Checkout repository
@@ -33,6 +36,7 @@ jobs:
         id: snap
         uses: actions/github-script@v7
         with:
+          github-token: ${{ env.GH_TOKEN }}
           script: |
             const { execSync } = require('child_process');
             const info = execSync('snap info microceph', { encoding: 'utf-8' });
@@ -78,6 +82,7 @@ jobs:
         id: verify
         uses: actions/github-script@v7
         with:
+          github-token: ${{ env.GH_TOKEN }}
           script: |
             const target = '${{ steps.snap.outputs.commit }}'.slice(0, 7);
             core.info(`Looking for a commit starting with "${target}" …`);
@@ -103,12 +108,12 @@ jobs:
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/github-script@v7
         with:
+          github-token: ${{ env.GH_TOKEN }}
           script: |
             const commitSha = '${{ steps.verify.outputs.full_sha }}';
             const codeName = '${{ steps.snap.outputs.codeName }}';
             const version = '${{ steps.snap.outputs.version }}';
             const stableTag = `v${version}+${codeName}`;
-
             core.info(`Proposed stable tag: ${stableTag}`);
 
             // Get all tags
@@ -132,11 +137,9 @@ jobs:
               return;
             }
 
-            const latestTag = tags[0];
-            core.info(`Latest existing tag: ${latestTag.name}`);
-
-            if (latestTag.name === stableTag) {
-              core.info(`Tag "${stableTag}" already exists as latest tag. Nothing to do.`);
+            const tagExists = tags.find(t => t.name === stableTag);
+            if (tagExists) {
+              core.info(`Tag "${stableTag}" already exists. Nothing to do.`);
               return;
             }
 
@@ -147,5 +150,4 @@ jobs:
               ref: `refs/tags/${stableTag}`,
               sha: commitSha
             });
-
-            core.info(`Tag "${stableTag}" now created.`)
+            core.info(`Tag "${stableTag}" now created.`);
